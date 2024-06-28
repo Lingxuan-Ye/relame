@@ -447,10 +447,11 @@ def reindex(
         if parent.exists():
             for _ in parent.iterdir():
                 error(f"{fmtpath(parent)} already exists and is not empty")
-        parent.mkdir(exist_ok=True)
         align = max(min_align, len(str(len(group))))
         sort_metas(group)
         for index, meta in enumerate(group):
+            if index == 0:
+                parent.mkdir(exist_ok=True)
             serial = index + 1
             src = meta.path
             dst = parent / f"{serial:0{align}}{meta.suffix}"
