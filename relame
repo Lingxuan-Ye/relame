@@ -1,0 +1,522 @@
+#!/usr/bin/env python
+
+import json
+import re
+import shutil
+import sys
+from os.path import commonpath
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from typing import NamedTuple, NoReturn
+
+import click
+import magic
+import termstr
+from termstr import Color, Span, warn
+
+LOG_DIR = Path.home() / ".log" / "relame"
+
+
+def error(message: str) -> NoReturn:
+    termstr.error(message)
+    sys.exit(1)
+
+
+def success(src: Path, dst: Path) -> None:
+    src_ = Span(src).set_foreground(Color.RED).set_underline()
+    dst_ = Span(dst).set_foreground(Color.BLUE).set_underline()
+    termstr.success("")
+    termstr.cprint("-", str(src_), label_color=Color.RED, label_width=3)
+    termstr.cprint("+", str(dst_), label_color=Color.BLUE, label_width=3)
+    print()
+
+
+def fmtpath(path: Path) -> Span:
+    return Span(path).set_foreground(Color.BLUE).set_underline()
+
+
+def sanitize(path: Path) -> Path:
+    if not path.exists():
+        error(f"{fmtpath(path)} not exists")
+
+    if (
+        path.is_symlink()
+        or path.is_socket()
+        or path.is_fifo()
+        or path.is_char_device()
+        or path.is_block_device()
+    ):
+        error(f"{fmtpath(path)} is not a regular file or directory")
+
+    return path
+
+
+def check_base(base: Path) -> Path:
+    sanitize(base)
+
+    if not base.is_dir():
+        error(f"{fmtpath(base)} is not a directory")
+
+    absolute = base.resolve()
+    if (
+        not absolute.is_relative_to(Path("/media"))
+        and not absolute.is_relative_to(Path.home())
+        or absolute == Path.home()
+    ):
+        warn(f"current working directory is {fmtpath(absolute)}, continue? [y/N]")
+        if input().lower() != "y":
+            sys.exit(0)
+
+    return base
+
+
+class Meta(NamedTuple):
+    path: Path
+    is_dir: bool
+    type: str
+    suffix: str
+
+
+def get_meta(path: Path) -> Meta:
+    sanitize(path)
+
+    if path.is_dir():
+        return Meta(path, True, "", "")
+
+    mime = magic.Magic(mime=True)
+    type, rem = mime.from_file(str(path)).split("/", 1)
+    suffix = path.suffix.lower()
+
+    # image
+    if rem.startswith("jpeg"):
+        suffix = ".jpg"
+    elif rem.startswith("png"):
+        suffix = ".png"
+    elif rem.startswith("bmp"):
+        suffix = ".bmp"
+    elif rem.startswith("webp"):
+        suffix = ".webp"
+    elif rem.startswith("svg+xml"):
+        suffix = ".svg"
+    elif rem.startswith("tiff"):
+        suffix = ".tif"
+
+    # video
+    elif rem.startswith("mp4") and type == "video":
+        suffix = ".mp4"
+    elif rem.startswith("x-matroska"):
+        suffix = ".mkv"
+    elif rem.startswith("quicktime"):
+        suffix = ".mov"
+    elif rem.startswith("x-msvideo"):
+        suffix = ".avi"
+    elif rem.startswith("x-ms-wmv"):
+        suffix = ".wmv"
+    elif rem.startswith("webm"):
+        suffix = ".webm"
+    elif rem.startswith("mpeg"):
+        suffix = ".mpeg"
+
+    # audio
+    elif rem.startswith("mpeg"):
+        suffix = ".mp3"
+    elif rem.startswith("wav"):
+        suffix = ".wav"
+    elif rem.startswith("aac"):
+        suffix = ".aac"
+    elif rem.startswith("flac"):
+        suffix = ".flac"
+    elif rem.startswith("ogg"):
+        suffix = ".ogg"
+    elif rem.startswith("mp4") and type == "audio":
+        suffix = ".m4a"
+    elif rem.startswith("x-ms-wma"):
+        suffix = ".wma"
+
+    # others
+    elif rem.startswith("gif"):
+        suffix = ".gif"
+    elif rem.startswith("pdf"):
+        suffix = ".pdf"
+    elif rem.startswith("x-photoshop") or rem.startswith("vnd.adobe.photoshop"):
+        suffix = ".psd"
+
+    return Meta(path, False, type, suffix)
+
+
+class Groups(NamedTuple):
+    dir: list[Meta]
+    cover: list[Meta]
+    image: list[Meta]
+    video: list[Meta]
+    audio: list[Meta]
+    gif: list[Meta]
+    pdf: list[Meta]
+    psd: list[Meta]
+    unknown: list[Meta]
+
+
+def categorize(base: Path, recursive: bool = False) -> Groups:
+    groups = Groups([], [], [], [], [], [], [], [], [])
+
+    iter = base.rglob("*") if recursive else base.iterdir()
+    for item in iter:
+        meta = get_meta(item)
+        if meta.is_dir:
+            groups.dir.append(meta)
+        elif meta.suffix == ".gif":
+            groups.gif.append(meta)
+        elif meta.suffix == ".pdf":
+            groups.pdf.append(meta)
+        elif meta.suffix == ".psd":
+            groups.psd.append(meta)
+        elif meta.type == "image":
+            if meta.path.stem.strip().lower().startswith("cover"):
+                groups.cover.append(meta)
+            else:
+                groups.image.append(meta)
+        elif meta.type == "video":
+            groups.video.append(meta)
+        elif meta.type == "audio":
+            groups.audio.append(meta)
+        else:
+            groups.unknown.append(meta)
+
+    return groups
+
+
+def sort_metas(metas: list[Meta]) -> list[Meta]:
+    """
+    Sorts `metas` in-place.
+
+    `metas` require a common parent directory.
+    """
+
+    def get_common_parts(strings: list[str]) -> tuple[str, str]:
+        if not strings:
+            return "", ""
+        prefix = suffix = strings[0]
+        for s in strings[1:]:
+            while True:
+                unchanged = True
+                if not s.startswith(prefix):
+                    prefix = prefix[:-1]
+                    unchanged = False
+                if not s.endswith(suffix):
+                    suffix = suffix[1:]
+                    unchanged = False
+                if unchanged:
+                    break
+        return prefix, suffix
+
+    prefix, suffix = get_common_parts([meta.path.stem for meta in metas])
+    try:
+        pairs: list[tuple[int, Meta]] = []
+        for meta in metas:
+            serial = meta.path.stem.lstrip(prefix).rstrip(suffix)
+            pairs.append((int(serial), meta))
+    except ValueError:
+        metas.sort(key=lambda meta: meta.path)
+    else:
+        pairs.sort()
+        metas.clear()
+        metas.extend(meta for _, meta in pairs)
+    return metas
+
+
+def _load(file: Path) -> list[dict[str, str]]:
+    sanitize(file)
+
+    try:
+        with open(file, "r") as f:
+            content = f.read().strip()
+    except PermissionError:
+        error(f"failed to read {fmtpath(file)}")
+
+    log: list[dict[str, str]] = []
+    if content:
+        try:
+            obj = json.loads(content)
+        except json.JSONDecodeError:
+            error(f"failed to parse {fmtpath(file)}")
+        if not isinstance(obj, list):
+            error(f"invalid format in {fmtpath(file)}")
+        log.extend(obj)
+
+    for entry in log:
+        if not isinstance(entry, dict):
+            error(f"invalid format in {fmtpath(file)}")
+        for src, dst in entry.items():
+            if not isinstance(src, str) or not isinstance(dst, str):
+                error(f"invalid format in {fmtpath(file)}")
+
+    return log
+
+
+def load(label: str) -> list[dict[Path, Path]]:
+    file = LOG_DIR / f"{label}.log"
+    log = _load(file)
+    return [{Path(src): Path(dst) for src, dst in entry.items()} for entry in log]
+
+
+def pop_log(label: str) -> dict[Path, Path]:
+    file = LOG_DIR / f"{label}.log"
+
+    log = _load(file)
+    entry = log.pop()
+
+    try:
+        with open(file, "w") as f:
+            json.dump(log, f, ensure_ascii=False, indent=4)
+    except PermissionError:
+        error(f"failed to write {fmtpath(file)}")
+
+    return {Path(src): Path(dst) for src, dst in entry.items()}
+
+
+def dump(map: dict[Path, Path], label: str, overwrite: bool = False) -> None:
+    file = LOG_DIR / f"{label}.log"
+
+    log: list[dict[str, str]] = []
+    if file.exists() and not overwrite:
+        log.extend(_load(file))
+    entry = {str(src.resolve()): str(dst.resolve()) for src, dst in map.items()}
+    log.append(entry)
+
+    try:
+        with open(file, "w") as f:
+            json.dump(log, f, ensure_ascii=False, indent=4)
+    except PermissionError:
+        error(f"failed to write {fmtpath(file)}")
+
+
+@click.group()
+def cli() -> None:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+@cli.command()
+@click.argument(
+    "base",
+    type=click.Path(
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        writable=True,
+        path_type=Path,
+    ),
+    default=Path.cwd(),
+)
+@click.option("--quiet/--verbose")
+def flatten(base: Path, quiet: bool) -> None:
+    check_base(base)
+
+    map: list[tuple[Path, Path]] = []
+    for item in base.rglob("*"):
+        if sanitize(item).is_file():
+            flattened = base / "_".join(item.relative_to(base).parts)
+            if flattened.exists():
+                if item == flattened:
+                    continue
+                error(f"{fmtpath(flattened)} already exists")
+            map.append((item, flattened))
+    map.sort()
+
+    for src, dst in map:
+        src.rename(dst)
+        if not quiet:
+            success(src, dst)
+
+    for item in base.iterdir():
+        if item.is_dir():
+            shutil.rmtree(item)
+
+    dump(dict(map), "common")
+
+
+@cli.command()
+@click.argument(
+    "base",
+    type=click.Path(
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        writable=True,
+        path_type=Path,
+    ),
+    default=Path.cwd(),
+)
+@click.option("-D", "--dir", is_flag=True)
+@click.option("-c/-C", "--cover/--no-cover", default=True)
+@click.option("-i", "--image", is_flag=True)
+@click.option("-v", "--video", is_flag=True)
+@click.option("-a", "--audio", is_flag=True)
+@click.option("--gif", is_flag=True)
+@click.option("--pdf", is_flag=True)
+@click.option("--psd", is_flag=True)
+@click.option("--unknown", is_flag=True)
+@click.option("--align", "min_align", default=3, type=int)
+@click.option("--quiet/--verbose")
+def reindex(
+    base: Path,
+    dir: bool,
+    cover: bool,
+    image: bool,
+    video: bool,
+    audio: bool,
+    gif: bool,
+    pdf: bool,
+    psd: bool,
+    unknown: bool,
+    min_align: int,
+    quiet: bool,
+) -> None:
+    check_base(base)
+
+    groups = categorize(base, recursive=False)
+    map: dict[Path, Path] = {}
+    temp_map: dict[Path, Path] = {}
+
+    if dir:
+        parent = base
+        align = max(min_align, len(str(len(groups.dir))))
+        indexed: list[tuple[int, str, Meta]] = []
+        unindexed: list[Meta] = []
+        for item in groups.dir:
+            name = item.path.name.strip()
+            if result := re.match(r"^\d+", name):
+                numstr = result.group()
+                serial = int(numstr)
+                name = name[len(numstr) :].lstrip().lstrip("-").lstrip()
+                indexed.append((serial, name, item))
+            else:
+                unindexed.append(item)
+        indexed.sort(key=lambda x: (x[0], x[1]))
+        unindexed.sort(key=lambda x: x.path)
+        groups.dir.clear()
+        groups.dir.extend([meta for _, _, meta in indexed])
+        groups.dir.extend(unindexed)
+        for index, meta in enumerate(groups.dir):
+            serial = index + 1
+            src = meta.path
+            name = re.sub(r"^\d+", "", src.name.strip()).lstrip().lstrip("-").lstrip()
+            if not name:
+                dst = parent / f"{serial:0{align}}"
+            else:
+                dst = parent / f"{serial:0{align}} - {name}"
+            temp_map[src] = dst
+        with TemporaryDirectory(dir=base) as temp_dir:
+            for src, dst in temp_map.items():
+                temp = Path(temp_dir) / dst.name
+                src.rename(temp)
+            for src, dst in temp_map.items():
+                temp = Path(temp_dir) / dst.name
+                temp.rename(dst)
+                if not quiet:
+                    success(src, dst)
+        map.update(temp_map)
+        temp_map.clear()
+
+    if cover:
+        parent = base
+        groups.cover.sort(key=lambda meta: meta.path.stem.lower())
+        for index, meta in enumerate(groups.cover):
+            serial = index + 1
+            src = meta.path
+            if serial == 1:
+                dst = parent / "cover"
+            else:
+                dst = parent / f"cover {serial}"
+            temp_map[src] = dst
+        with TemporaryDirectory(dir=base) as temp_dir:
+            for src, dst in temp_map.items():
+                temp = Path(temp_dir) / dst.name
+                src.rename(temp)
+            for src, dst in temp_map.items():
+                temp = Path(temp_dir) / dst.name
+                temp.rename(dst)
+                if not quiet:
+                    success(src, dst)
+        map.update(temp_map)
+        temp_map.clear()
+
+    def reindex_files(group: list[Meta], label: str) -> None:
+        parent = base / label
+        if parent.exists():
+            for _ in parent.iterdir():
+                error(f"{fmtpath(parent)} already exists and is not empty")
+        parent.mkdir(exist_ok=True)
+        align = max(min_align, len(str(len(group))))
+        sort_metas(group)
+        for index, meta in enumerate(group):
+            serial = index + 1
+            src = meta.path
+            dst = parent / f"{serial:0{align}}{meta.suffix}"
+            temp_map[src] = dst
+
+    if image:
+        label = "image"
+        reindex_files(groups.image, label)
+
+    if video:
+        label = "video"
+        reindex_files(groups.video, label)
+
+    if audio:
+        label = "audio"
+        reindex_files(groups.audio, label)
+
+    if gif:
+        label = "gif"
+        reindex_files(groups.gif, label)
+
+    if pdf:
+        label = "pdf"
+        reindex_files(groups.pdf, label)
+
+    if psd:
+        label = "psd"
+        reindex_files(groups.psd, label)
+
+    if unknown:
+        label = "others"
+        reindex_files(groups.unknown, label)
+
+    for src, dst in temp_map.items():
+        src.rename(dst)
+        if not quiet:
+            success(src, dst)
+
+    map.update(temp_map)
+    dump(map, "common")
+
+
+@cli.command()
+@click.option("--quiet/--verbose")
+def revert(quiet: bool) -> None:
+    map = {dst: src for src, dst in pop_log("common").items()}
+
+    if not map:
+        return
+
+    base = Path(commonpath([path for pair in map.items() for path in pair]))
+    with TemporaryDirectory(dir=base) as temp_dir:
+        for src, dst in map.items():
+            temp = Path(temp_dir) / dst.name
+            src.rename(temp)
+        for src, dst in map.items():
+            temp = Path(temp_dir) / dst.name
+            temp.rename(dst)
+            if not quiet:
+                success(src, dst)
+
+    dump(map, "fix")
+
+
+if __name__ == "__main__":
+    try:
+        cli()
+    except Exception as e:
+        error(str(e))
