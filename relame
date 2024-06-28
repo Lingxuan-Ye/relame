@@ -213,7 +213,7 @@ def sort_metas(metas: list[Meta]) -> list[Meta]:
     try:
         pairs: list[tuple[int, Meta]] = []
         for meta in metas:
-            serial = meta.path.stem.lstrip(prefix).rstrip(suffix)
+            serial = meta.path.stem.removeprefix(prefix).removesuffix(suffix)
             pairs.append((int(serial), meta))
     except ValueError:
         metas.sort(key=lambda meta: meta.path)
@@ -389,7 +389,7 @@ def reindex(
             if result := re.match(r"^\d+", name):
                 numstr = result.group()
                 serial = int(numstr)
-                name = name[len(numstr) :].lstrip().lstrip("-").lstrip()
+                name = name[len(numstr) :].lstrip("- ")
                 indexed.append((serial, name, item))
             else:
                 unindexed.append(item)
@@ -401,7 +401,7 @@ def reindex(
         for index, meta in enumerate(groups.dir):
             serial = index + 1
             src = meta.path
-            name = re.sub(r"^\d+", "", src.name.strip()).lstrip().lstrip("-").lstrip()
+            name = re.sub(r"^\d+", "", src.name.strip()).lstrip("- ")
             if not name:
                 dst = parent / f"{serial:0{align}}"
             else:
